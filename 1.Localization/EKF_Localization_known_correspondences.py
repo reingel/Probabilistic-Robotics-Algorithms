@@ -18,7 +18,8 @@ class ExtendedKalmanFilter():
         self.load_data(dataset, end_frame)
         self.initialization(R, Q)
         for data in self.data:
-            if (data[1] == -1):
+            subject_num = data[1]
+            if (subject_num == -1):
                 self.motion_update(data)
             else:
                 self.measurement_update(data)
@@ -39,42 +40,50 @@ class ExtendedKalmanFilter():
 
         # Collect all input data and sort by timestamp
         # Add subject "odom" = -1 for odometry data
-        odom_data = np.insert(self.odometry_data, 1, -1, axis = 1)
+        odom_data = np.insert(self.odometry_data, 1, -1, axis = 1) # column 1에 -1을 추가
         self.data = np.concatenate((odom_data, self.measurement_data), axis = 0)
         self.data = self.data[np.argsort(self.data[:, 0])]
+        '''
+        self.data에는 시간순으로 정렬된 odometry data(-1, v, w)와 measurement data(subject#, r, phi)가 들어있다.
+        self.data[:, 0]은 timestamp
+        self.data[:, 1]은 subject number
+        self.data[:, 2]은 range or forward_V(subject가 -1인 경우)
+        self.data[:, 3]은 bearing or angular_v(subject가 -1인 경우)
+        '''
 
-        # Remove all data before the fisrt timestamp of groundtruth
+        # Remove all data before the first timestamp of groundtruth
         # Use first groundtruth data as the initial location of the robot
         for i in range(len(self.data)):
-            if (self.data[i][0] > self.groundtruth_data[0][0]):
+            if (self.data[i, 0] > self.groundtruth_data[0, 0]):
                 break
-        self.data = self.data[i:]
+        self.data = self.data[i:, :]
 
         # Remove all data after the specified number of frames
-        self.data = self.data[:end_frame]
-        cut_timestamp = self.data[end_frame - 1][0]
+        self.data = self.data[:end_frame, :]
+        cut_timestamp = self.data[-1, 0]
         # Remove all groundtruth after the corresponding timestamp
         for i in range(len(self.groundtruth_data)):
             if (self.groundtruth_data[i][0] >= cut_timestamp):
                 break
-        self.groundtruth_data = self.groundtruth_data[:i]
+        self.groundtruth_data = self.groundtruth_data[:i, :]
 
         # Combine barcode Subject# with landmark Subject# to create lookup-table
         # [x[m], y[m], x std-dev[m], y std-dev[m]]
-        self.landmark_locations = {}
+        self.landmark_locations = {} # dictionary
         for i in range(5, len(self.barcodes_data), 1):
-            self.landmark_locations[self.barcodes_data[i][1]] = self.landmark_groundtruth_data[i - 5][1:]
+            subject_num = self.barcodes_data[i, 1]
+            self.landmark_locations[subject_num] = self.landmark_groundtruth_data[i - 5, 1:]
 
         # Lookup table to map barcode Subjec# to landmark Subject#
         # Barcode 6 is the first landmark (1 - 15 for 6 - 20)
         self.landmark_indexes = {}
         for i in range(5, len(self.barcodes_data), 1):
-            self.landmark_indexes[self.barcodes_data[i][1]] = i - 4
+            subject_num = self.barcodes_data[i, 1]
+            self.landmark_indexes[subject_num] = i - 4
 
     def initialization(self, R, Q):
         # Initial state
-        self.states = np.array([self.groundtruth_data[0]])
-        self.last_timestamp = self.states[-1][0]
+        self.states = np.array([self.groundtruth_data[0, :]])
         # Choose very small process covariance because we are using the ground truth data for initial location
         self.sigma = np.diagflat([1e-10, 1e-10, 1e-10])
         # States with measurement update
@@ -94,51 +103,79 @@ class ExtendedKalmanFilter():
         #   x_t  =  x_t-1 + v * cosθ_t-1 * delta_t
         #   y_t  =  y_t-1 + v * sinθ_t-1 * delta_t
         #   θ_t  =  θ_t-1 + w * delta_t
+
+        # Get last state
+        last_state = self.states[-1]
+        t_1 = last_state[0]
+        x_t_1 = last_state[1]
+        y_t_1 = last_state[2]
+        th_t_1 = last_state[3]
+
+        # Get control data
+        t = control[0]
+        subject_num = control[1]
+        v_t = control[2]
+        w_t = control[3]
+
         # Skip motion update if two odometry data are too close
-        delta_t = control[0] - self.last_timestamp
-        if (delta_t < 0.001):
+        dt = t - t_1
+        if (dt < 0.001):
             return
         # Compute updated [x, y, theta]
-        x_t = self.states[-1][1] + control[2] * np.cos(self.states[-1][3]) * delta_t
-        y_t = self.states[-1][2] + control[2] * np.sin(self.states[-1][3]) * delta_t
-        theta_t = self.states[-1][3] + control[3] * delta_t
+        x_t_bar = x_t_1 + v_t * np.cos(th_t_1) * dt
+        y_t_bar = y_t_1 + v_t * np.sin(th_t_1) * dt
+        th_t_bar = th_t_1 + w_t * dt
         # Limit θ within [-pi, pi]
-        if (theta_t > np.pi):
-            theta_t -= 2 * np.pi
-        elif (theta_t < -np.pi):
-            theta_t += 2 * np.pi
-        self.last_timestamp = control[0]
-        self.states = np.append(self.states, np.array([[control[0], x_t, y_t, theta_t]]), axis = 0)
+        if (th_t_bar > np.pi):
+            th_t_bar -= 2 * np.pi
+        elif (th_t_bar < -np.pi):
+            th_t_bar += 2 * np.pi
+        # append updated state
+        updated_state = np.array([[t, x_t_bar, y_t_bar, th_t_bar]])
+        self.states = np.append(self.states, updated_state, axis = 0)
 
         # ------ Step 2: Linearize state-transition by Jacobian ------#
         # Jacobian: G = d g(u_t, x_t-1) / d x_t-1
-        #         1  0  -v * delta_t * sinθ_t-1
-        #   G  =  0  1   v * delta_t * cosθ_t-1
+        #         1  0  -v * dt * sinθ_t-1
+        #   G  =  0  1   v * dt * cosθ_t-1
         #         0  0             1
-        G_1 = np.array([1, 0, - control[2] * delta_t * np.sin(self.states[-1][3])])
-        G_2 = np.array([0, 1, control[2] * delta_t * np.cos(self.states[-1][3])])
-        G_3 = np.array([0, 0, 1])
-        self.G = np.array([G_1, G_2, G_3])
+        self.G = np.array([
+            [1, 0, -v_t * dt * np.sin(th_t_1)],
+            [0, 1, v_t * dt * np.cos(th_t_1)],
+            [0, 0, 1],
+        ])
 
         # ---------------- Step 3: Covariance update ------------------#
         self.sigma = self.G.dot(self.sigma).dot(self.G.T) + self.R
 
     def measurement_update(self, measurement):
+        # Measurement: [Time[s], Subject#, range[m], bearing[rad]]
+        t = measurement[0]
+        subject_num = measurement[1]
+        r_t = measurement[2]
+        phi_t = measurement[3]
+
         # Continue if landmark is not found in self.landmark_locations
-        if not measurement[1] in self.landmark_locations:
+        if not subject_num in self.landmark_locations:
             return
+        
+        landmark_location = self.landmark_locations[subject_num]
+        x_l = landmark_location[0]
+        y_l = landmark_location[1]
+
+        updated_state = self.states[-1]
+        t_1 = updated_state[0]
+        x_t_bar = updated_state[1]
+        y_t_bar = updated_state[2]
+        th_t_bar = updated_state[3]
 
         # ---------------- Step 1: Measurement update -----------------#
         #   range   =  sqrt((x_l - x_t)^2 + (y_l - y_t)^2)
         #  bearing  =  atan2((y_l - y_t) / (x_l - x_t)) - θ_t
-        x_l = self.landmark_locations[measurement[1]][0]
-        y_l = self.landmark_locations[measurement[1]][1]
-        x_t = self.states[-1][1]
-        y_t = self.states[-1][2]
-        theta_t = self.states[-1][3]
-        q = (x_l - x_t) * (x_l - x_t) + (y_l - y_t) * (y_l - y_t)
-        range_expected = np.sqrt(q)
-        bearing_expected = np.arctan2(y_l - y_t, x_l - x_t) - theta_t
+        q = (x_l - x_t_bar) **2 + (y_l - y_t_bar) **2
+        sqrt_q = np.sqrt(q)
+        range_expected = sqrt_q
+        bearing_expected = np.arctan2(y_l - y_t_bar, x_l - x_t_bar) - th_t_bar
 
         # -------- Step 2: Linearize Measurement by Jacobian ----------#
         # Jacobian: H = d h(x_t) / d x_t
@@ -146,21 +183,21 @@ class ExtendedKalmanFilter():
         #  H  =      (y_l - y_t) / q         -(x_l - x_t) / q     -1
         #                  0                         0             0
         #  q = (x_l - x_t)^2 + (y_l - y_t)^2
-        H_1 = np.array([-(x_l - x_t) / np.sqrt(q), -(y_l - y_t) / np. sqrt(q), 0])
-        H_2 = np.array([(y_l - y_t) / q, -(x_l - x_t) / q, -1])
-        H_3 = np.array([0, 0, 0])
-        self.H = np.array([H_1, H_2, H_3])
+        self.H = np.array([
+            [-(x_l - x_t_bar) / sqrt_q, -(y_l - y_t_bar) / sqrt_q, 0],
+            [(y_l - y_t_bar) / q, -(x_l - x_t_bar) / q, -1],
+            [0, 0, 0],
+        ])
 
         # ---------------- Step 3: Kalman gain update -----------------#
         S_t = self.H.dot(self.sigma).dot(self.H.T) + self.Q
         self.K = self.sigma.dot(self.H.T).dot(np.linalg.inv(S_t))
 
         # ------------------- Step 4: mean update ---------------------#
-        difference = np.array([measurement[2] - range_expected, measurement[3] - bearing_expected, 0])
+        difference = np.array([r_t - range_expected, phi_t - bearing_expected, 0])
         innovation = self.K.dot(difference)
-        self.last_timestamp = measurement[0]
-        self.states = np.append(self.states, np.array([[self.last_timestamp, x_t + innovation[0], y_t + innovation[1], theta_t + innovation[2]]]), axis=0)
-        self.states_measurement.append([x_t + innovation[0], y_t + innovation[1]])
+        self.states = np.append(self.states, np.array([[t, x_t_bar + innovation[0], y_t_bar + innovation[1], th_t_bar + innovation[2]]]), axis=0)
+        self.states_measurement.append([x_t_bar + innovation[0], y_t_bar + innovation[1]])
 
         # ---------------- Step 5: covariance update ------------------#
         self.sigma = (np.identity(3) - self.K.dot(self.H)).dot(self.sigma)
@@ -179,7 +216,7 @@ class ExtendedKalmanFilter():
         # Measurement update locations
         if (len(self.states_measurement) > 0):
             self.states_measurement = np.array(self.states_measurement)
-            plt.scatter(self.states_measurement[:, 0], self.states_measurement[:, 1], s=10, c='k', alpha='0.5', label="Measurement updates")
+            plt.scatter(self.states_measurement[:, 0], self.states_measurement[:, 1], s=10, c='k', alpha=0.5, label="Measurement updates")
 
         # Landmark ground truth locations and indexes
         landmark_xs = []
@@ -207,7 +244,7 @@ if __name__ == "__main__":
     # Q = np.diagflat(np.array([350, 350, 1e16])) ** 2
 
     # Dataset 1
-    dataset = "../0.Dataset1"
+    dataset = "0.Dataset1"
     end_frame = 3200
     # State covariance matrix
     R = np.diagflat(np.array([1.0, 1.0, 10.0])) ** 2
@@ -215,3 +252,5 @@ if __name__ == "__main__":
     Q = np.diagflat(np.array([30, 30, 1e16])) ** 2
     #
     ekf = ExtendedKalmanFilter(dataset, end_frame, R, Q)
+
+    a=1
